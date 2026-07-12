@@ -1,18 +1,23 @@
-#SingleInstance
+﻿#SingleInstance
 #Requires AutoHotkey v2+
+; Allow a key's handler to re-enter (e.g. a fast re-press arriving during the brief
+; restrike blink) instead of silently discarding the press. Handlers are non-blocking,
+; so a few concurrent threads are cheap.
+#MaxThreadsPerHotkey 3
+#MaxThreads 20
 
 ; On-Screen Keyboard (v2) -- Original by Jon
 ; https://autohotkey.com/docs/scripts/KeyboardOnScreen.htm
 ; Converted to AHK v2 by kunkel321 using Claude AI. 
 ; Code also reworked with ChatGPT.
-; Version date: 7-10-2026  
+; Version date: 7-12-2026  
 ;
-; Ctrl+Alt+K show/hide; Alt+arrow / Alt+wheel transparency
 ; This script creates a mock keyboard at the bottom of your screen that shows
 ; the keys you are pressing in real time. It helps with learning to touch-type
 ; by not having to look at the physical keyboard. It might also be useful as 
 ; an on-screen display for screencasts(?) The keyboard appearance can be
 ; customized. You can hide/show it via the tray menu.  Drag to move.
+; Ctrl+Alt+K show/hide; Alt+arrow / Alt+wheel transparency
 
 TraySetIcon("shell32.dll",45) ; Icon of a brownish square with a key image.
 ^Esc::ExitApp ; Ctrl+Esc to kill script
@@ -26,10 +31,35 @@ k_FontStyle := "Bold"    ; Examples: "Italic Underline"
 ; Text controls are used instead of real Button controls because they allow
 ; reliable background-color changes for clearer visual feedback.
 k_KeyBackColor := "E6E6E6"       ; normal key/button fill
-k_KeyActiveColor := "ffee00"     ; held/pressed key fill
+k_KeyActiveColor := "ff3d3d"     ; held/pressed key fill
 k_MouseBackColor := "E6E6E6"     ; normal mouse button/wheel fill
-k_MouseActiveColor := "FFD966"   ; mouse button hold / wheel flash fill
+k_MouseActiveColor := "1048ff"   ; mouse button hold / wheel flash fill
 k_KeyTextColor := "000000"       ; key label text
+
+; Release fade: when a key is let go, its highlight steps back down to the normal
+; fill through a precomputed color ramp instead of snapping off. The ramp runs from
+; the ACTIVE color (step 1) to the NORMAL color (last step); no new colors needed.
+;   k_FadeSteps    = number of colors in the ramp, endpoints included.
+;                    Set to 1 to disable the fade (instant off, original behavior).
+;                    More steps = smoother; fewer = chunkier.
+;   k_FadeDuration = total time (ms) for a released key to travel the whole ramp.
+k_FadeSteps := 12
+k_FadeDuration := 400
+; Restrike blink: when a key is pressed again while it is still fading out (e.g. the
+; double "o" in "book"), snap it to the normal color for this many ms before
+; re-highlighting. Without it, the key jumps from a partly-faded tint straight back
+; to full active, so the two strikes read as one long press. Set to 0 to disable.
+k_RestrikeBlinkMs := 45
+
+; Mouse gestures that hide the keyboard (Ctrl+Alt+K or the tray item brings it back).
+; Set either to false to disable that gesture.
+k_DblClickHides := true
+k_RightClickHides := false
+; Per-step dwell = the timer period. Guard against divide-by-zero when fade is off.
+k_FadeStepMs := (k_FadeSteps > 1) ? Max(15, Round(k_FadeDuration / (k_FadeSteps - 1))) : 0
+; Precompute the two ramps once (keys and mouse buttons have different fills).
+k_KeyFadeColors := BuildFadeGradient(k_KeyActiveColor, k_KeyBackColor, k_FadeSteps)
+k_MouseFadeColors := BuildFadeGradient(k_MouseActiveColor, k_MouseBackColor, k_FadeSteps)
 
 ; Global show/hide toggle. The keyboard is a passive display that runs while you
 ; type, so a bare key would clash with normal typing -- use a modifier combo.
@@ -87,6 +117,7 @@ k_FKeyNext := "x+" . k_KeyMargin . " " . k_FKeySize
 ;---- Maps to store key control references and each control's normal color
 buttons := Map()
 buttonNormalColors := Map()
+fadingKeys := Map()   ; keys currently fading out: buttonKey -> {colors, idx}
 
 ; Row 0: F-row (Esc, F1-F12, Del). Added FIRST so it sits at the top; the number
 ; row below flows down from it. Uses a smaller font, restored right after.
@@ -172,6 +203,16 @@ k_IsVisible := true
 ;---- Add drag-to-move functionality for borderless window
 OnMessage(0x0201, WM_LBUTTONDOWN)
 
+;---- Double-click to hide. Windows does NOT resend WM_LBUTTONDOWN for the second
+; click of a double-click -- it substitutes WM_LBUTTONDBLCLK -- so that is the
+; message to watch. 0x00A3 is the non-client twin, monitored too since this window
+; fakes a caption drag. (See k_DblClickHides.)
+OnMessage(0x0203, WM_LBUTTONDBLCLK)   ; WM_LBUTTONDBLCLK
+OnMessage(0x00A3, WM_LBUTTONDBLCLK)   ; WM_NCLBUTTONDBLCLK
+
+;---- Right-click anywhere on the keyboard hides it (see k_RightClickHides)
+OnMessage(0x0204, WM_RBUTTONDOWN)  ; WM_RBUTTONDOWN
+
 ;---- Block F10 / lone-Alt from opening the window's (nonexistent) menu, which
 ; otherwise traps the GUI in menu-modal mode: the F10 highlight sticks, other
 ; F-keys stop registering, and stray keys beep. Only matters when the GUI is
@@ -198,6 +239,14 @@ k_WindowY := MonBottom - k_WindowHeight
 WinMove(k_WindowX, k_WindowY, , , "ahk_id " k_ID)
 WinSetAlwaysOnTop(true, "ahk_id " k_ID)
 
+; NOTE ON DOWN/UP PAIRS: every key registers BOTH a down and an "up" hotkey, and
+; each handler returns immediately. Earlier versions used a single handler that sat
+; in KeyWait() until release -- but AHK pauses an interrupted thread until the
+; interrupting one finishes, so during rollover typing (e.g. "there", where R goes
+; down before E comes up) the R handler's KeyWait would trap the E handler. E never
+; got to start its fade, and its re-press was discarded by #MaxThreadsPerHotkey.
+; Non-blocking down/up handlers avoid the whole thread-stack problem.
+
 ;---- Register all ASCII character hotkeys (45 to 93: - through ])
 Loop 49 {
     k_ASCII := 44 + A_Index
@@ -206,36 +255,47 @@ Loop 49 {
     ; Skip special characters that cause issues
     if !InStr("<>^~,", k_char) {
         Hotkey("~*" . k_char, KeyPress)
+        Hotkey("~*" . k_char . " up", KeyRelease)
     }
 }
 
 ;---- Register modifier key hotkeys
-for key in ["LShift", "RShift", "LCtrl", "RCtrl", "LAlt", "RAlt", "LWin", "RWin"]
-    Hotkey("~*" . key, ModifierPress)
+for key in ["LShift", "RShift", "LCtrl", "RCtrl", "LAlt", "RAlt", "LWin", "RWin"] {
+    Hotkey("~*" . key, KeyPress)
+    Hotkey("~*" . key . " up", KeyRelease)
+}
 
 ;---- Register special key hotkeys
-for key in ["Backspace", "Space", "Tab", "Enter", ",", "'"]
+for key in ["Backspace", "Space", "Tab", "Enter", ",", "'"] {
     Hotkey("~*" . key, KeyPress)
-
+    Hotkey("~*" . key . " up", KeyRelease)
+}
 
 ;---- Register arrow key hotkeys
-for key in ["Up", "Left", "Down", "Right"]
+for key in ["Up", "Left", "Down", "Right"] {
     Hotkey("~*" . key, KeyPress)
+    Hotkey("~*" . key . " up", KeyRelease)
+}
 
 ;---- Register F-row hotkeys (F1-F12 and Del light up like normal keys)
-for key in ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "Delete"]
+for key in ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "Delete"] {
     Hotkey("~*" . key, KeyPress)
+    Hotkey("~*" . key . " up", KeyRelease)
+}
 
 ;---- Register mouse hotkeys
-for key in ["LButton", "RButton"]
-    Hotkey("~*" . key, MouseButtonPress)
+for key in ["LButton", "RButton"] {
+    Hotkey("~*" . key, KeyPress)
+    Hotkey("~*" . key . " up", KeyRelease)
+}
 for key in ["WheelUp", "WheelDown"]
     Hotkey("~*" . key, MouseWheelPress)
 
 ;---- Register Esc key: lights up the on-screen Esc AND hides GUI when active.
 ; Passthrough (~*) so Esc still reaches other apps. ^Esc::ExitApp stays in effect
 ; because that more-specific variant wins for Ctrl+Esc.
-Hotkey("~*Esc", EscPress)
+Hotkey("~*Esc", KeyPress)
+Hotkey("~*Esc up", EscRelease)
 
 ;---- Register the global show/hide toggle (works even while the keyboard is hidden)
 Hotkey(k_ToggleHotkey, ToggleKeyboard)
@@ -274,111 +334,151 @@ AddKey(buttonKey, options, label := "", normalColor := "") {
 }
 
 SetKeyActive(buttonKey, isActive := true, isMouse := false) {
-    global buttons, buttonNormalColors, k_KeyActiveColor, k_MouseActiveColor
+    global buttons, buttonNormalColors, fadingKeys, k_KeyActiveColor, k_MouseActiveColor
+    global k_KeyBackColor, k_RestrikeBlinkMs
 
     if !buttons.Has(buttonKey)
         return
 
-    ctrl := buttons[buttonKey]
+    normalColor := buttonNormalColors.Has(buttonKey) ? buttonNormalColors[buttonKey] : k_KeyBackColor
 
-    ; Use the key's stored normal color when turning it off.
-    ; This matters because mouse buttons can use a different normal color than keys.
-    if isActive
+    if isActive {
+        ; Re-pressed while still fading (double letters like the "oo" in "book").
+        ; Delete from the fade map FIRST so the shared FadeTick timer can't repaint
+        ; over the blink, then flash the normal color so the second strike reads as
+        ; a distinct press instead of merging into the first one's lingering glow.
+        if fadingKeys.Has(buttonKey) {
+            fadingKeys.Delete(buttonKey)
+            if (k_RestrikeBlinkMs > 0) {
+                PaintKey(buttonKey, normalColor)
+                Sleep(k_RestrikeBlinkMs)   ; brief, and the keystroke itself already passed through
+            }
+        }
         color := isMouse ? k_MouseActiveColor : k_KeyActiveColor
-    else
-        color := buttonNormalColors.Has(buttonKey) ? buttonNormalColors[buttonKey] : "E6E6E6"
+    } else {
+        color := normalColor
+    }
 
-    ; Text controls sometimes need a forced repaint after their background is changed,
-    ; especially on themed Windows controls.
+    PaintKey(buttonKey, color)
+}
+
+;---- Paint a key's background and force the repaint. Themed Text controls don't
+; always refresh on a background change, hence the belt-and-suspenders redraw.
+PaintKey(buttonKey, color) {
+    global buttons
+    if !buttons.Has(buttonKey)
+        return
+    ctrl := buttons[buttonKey]
     ctrl.Opt("Background" . color)
     try ctrl.Redraw()
     try DllCall("RedrawWindow", "Ptr", ctrl.Hwnd, "Ptr", 0, "Ptr", 0, "UInt", 0x0105)
 }
 
-;---- Hotkey handler for regular keys
-KeyPress(ThisHotkey) {
-    global k_ID, buttons
-    
-    ; Get the key from A_ThisHotkey and remove the hotkey prefix (~*)
-    thisKey := A_ThisHotkey
-    thisKey := StrReplace(thisKey, "~", "")
+;---- Build a `steps`-long color ramp from activeHex down to normalHex (inclusive).
+; Returns bare "RRGGBB" strings so they drop straight into Gui Background options.
+; A straight two-color lerp -- unlike the 3-point white/color/black swatch gradient.
+; Function was inspired by ColorGradient() by Lateralus138 and Teadrinker.
+BuildFadeGradient(activeHex, normalHex, steps) {
+    grad := []
+    if (steps <= 1) {
+        grad.Push(normalHex)   ; fade disabled: ramp is just the normal color
+        return grad
+    }
+    aR := Integer("0x" . SubStr(activeHex, 1, 2)), nR := Integer("0x" . SubStr(normalHex, 1, 2))
+    aG := Integer("0x" . SubStr(activeHex, 3, 2)), nG := Integer("0x" . SubStr(normalHex, 3, 2))
+    aB := Integer("0x" . SubStr(activeHex, 5, 2)), nB := Integer("0x" . SubStr(normalHex, 5, 2))
+    Loop steps {
+        t := (A_Index - 1) / (steps - 1)   ; 0 at active end, 1 at normal end
+        r := Round(aR + (nR - aR) * t)
+        g := Round(aG + (nG - aG) * t)
+        b := Round(aB + (nB - aB) * t)
+        grad.Push(Format("{:02X}{:02X}{:02X}", r, g, b))
+    }
+    return grad
+}
+
+;---- Start a released key fading toward its normal fill. idx 1 is the active color
+; (already showing), so the shared timer just walks each fading key one step per tick.
+StartKeyFade(buttonKey, isMouse := false) {
+    global buttons, buttonNormalColors, fadingKeys, k_KeyFadeColors, k_MouseFadeColors
+    global k_FadeSteps, k_FadeStepMs, k_KeyBackColor
+
+    if !buttons.Has(buttonKey)
+        return
+
+    ; Fade disabled -> revert instantly to the key's stored normal color.
+    if (k_FadeSteps <= 1) {
+        PaintKey(buttonKey, buttonNormalColors.Has(buttonKey) ? buttonNormalColors[buttonKey] : k_KeyBackColor)
+        return
+    }
+
+    fadingKeys[buttonKey] := { colors: (isMouse ? k_MouseFadeColors : k_KeyFadeColors), idx: 1 }
+    SetTimer(FadeTick, k_FadeStepMs)   ; (re)arm the one shared fade timer
+}
+
+;---- Shared timer: advance every fading key one step toward normal; drop finished
+; keys; stop the timer once nothing is fading.
+FadeTick() {
+    global fadingKeys, k_FadeSteps
+    for key, st in fadingKeys.Clone() {   ; clone so we can delete during iteration
+        st.idx += 1
+        PaintKey(key, st.colors[st.idx])
+        if (st.idx >= k_FadeSteps)
+            fadingKeys.Delete(key)
+    }
+    if (fadingKeys.Count = 0)
+        SetTimer(FadeTick, 0)
+}
+
+;---- Resolve A_ThisHotkey into the button key used in the `buttons` map.
+; Handles the "~*" prefix, the trailing " up" on release hotkeys, modifier
+; L/R variants (LShift -> Shift), and the arrow glyph labels.
+ResolveButtonKey(hk) {
+    thisKey := StrReplace(hk, "~", "")
     thisKey := StrReplace(thisKey, "*", "")
-    
-    ; Map key names to button labels
-    if thisKey = "Backspace"
-        buttonLabel := "BS"
-    else if thisKey = "Enter"
-        buttonLabel := "Enter"
-    else if thisKey = "Tab"
-        buttonLabel := "Tab"
-    else if thisKey = "Space"
-        buttonLabel := "Space"
-    else if thisKey = "Up"
-        buttonLabel := "↑"
-    else if thisKey = "Left"
-        buttonLabel := "←"
-    else if thisKey = "Down"
-        buttonLabel := "↓"
-    else if thisKey = "Right"
-        buttonLabel := "→"
-    else
-        buttonLabel := thisKey
-    
-    if buttons.Has(thisKey) {
-        SetKeyActive(thisKey, true)
-        KeyWait(thisKey)
-        SetKeyActive(thisKey, false)
+    thisKey := RegExReplace(thisKey, "i)\s+up$", "")   ; strip release suffix
+
+    ; Modifiers: collapse Left/Right variants onto the single on-screen button.
+    if InStr(thisKey, "Shift")
+        return "Shift"
+    if InStr(thisKey, "Ctrl")
+        return "Ctrl"
+    if InStr(thisKey, "Alt")
+        return "Alt"
+    if InStr(thisKey, "Win")
+        return "Win"
+
+    switch thisKey {
+        case "Backspace": return "BS"
+        case "Esc":       return "Escape"   ; hotkey is "Esc", button is stored as "Escape"
+        case "Up":        return "↑"
+        case "Left":      return "←"
+        case "Down":      return "↓"
+        case "Right":     return "→"
     }
+    return thisKey
 }
 
-;---- Hotkey handler for modifier keys (Shift, Ctrl, Alt, Win)
-ModifierPress(ThisHotkey) {
-    global k_ID, buttons
-    
-    ; Extract key name: LShift, RShift, LCtrl, RCtrl, LAlt, RAlt, LWin, RWin
-    thisKey := A_ThisHotkey
-    thisKey := StrReplace(thisKey, "~*", "")
-    
-    ; Map to button labels and store original text
-    if InStr(thisKey, "Shift") {
-        buttonLabel := "Shift"
-        originalText := "Shift"
-    } else if InStr(thisKey, "Ctrl") {
-        buttonLabel := "Ctrl"
-        originalText := "Ctrl"
-    } else if InStr(thisKey, "Alt") {
-        buttonLabel := "Alt"
-        originalText := "Alt"
-    } else if InStr(thisKey, "Win") {
-        buttonLabel := "Win"
-        originalText := "Win"
-    } else {
-        buttonLabel := thisKey
-        originalText := thisKey
-    }
-    
-    if buttons.Has(buttonLabel)
-        SetKeyActive(buttonLabel, true)
-
-    KeyWait(thisKey)
-
-    if buttons.Has(buttonLabel)
-        SetKeyActive(buttonLabel, false)
+;---- True for the mouse buttons, which use their own active/normal colors.
+IsMouseKey(buttonKey) {
+    return (buttonKey = "LButton" || buttonKey = "RButton"
+         || buttonKey = "WheelUp" || buttonKey = "WheelDown")
 }
 
-
-;---- Hotkey handler for mouse buttons, including click-and-hold visual feedback
-MouseButtonPress(ThisHotkey) {
+;---- Key/button DOWN: highlight. Returns immediately -- never blocks.
+KeyPress(ThisHotkey) {
     global buttons
+    buttonKey := ResolveButtonKey(A_ThisHotkey)
+    if buttons.Has(buttonKey)
+        SetKeyActive(buttonKey, true, IsMouseKey(buttonKey))
+}
 
-    thisKey := A_ThisHotkey
-    thisKey := StrReplace(thisKey, "~*", "")
-
-    if buttons.Has(thisKey) {
-        SetKeyActive(thisKey, true, true)
-        KeyWait(thisKey)
-        SetKeyActive(thisKey, false, true)
-    }
+;---- Key/button UP: begin the fade. Returns immediately -- never blocks.
+KeyRelease(ThisHotkey) {
+    global buttons
+    buttonKey := ResolveButtonKey(A_ThisHotkey)
+    if buttons.Has(buttonKey)
+        StartKeyFade(buttonKey, IsMouseKey(buttonKey))
 }
 
 ;---- Hotkey handler for mouse wheel events
@@ -390,7 +490,8 @@ MouseWheelPress(ThisHotkey) {
 
     if buttons.Has(thisKey) {
         SetKeyActive(thisKey, true, true)
-        SetTimer(() => SetKeyActive(thisKey, false, true), -150)
+        ; Wheel events have no release, so hold the flash briefly, then fade it out.
+        SetTimer(() => StartKeyFade(thisKey, true), -150)
     }
 }
 
@@ -424,10 +525,47 @@ ToggleKeyboard(*) {
         ShowKeyboard()
 }
 
-;---- Handle drag-to-move for borderless window
+;---- Handle drag-to-move for the borderless window. The window has no title bar,
+; so a plain click is redirected into Windows' caption-drag loop.
 WM_LBUTTONDOWN(wParam, lParam, msg, hwnd) {
     global MyGui
-    PostMessage(0x00A1, 2)  ; 0x00A1 = WM_NCLBUTTONDOWN, 2 = HTCAPTION
+    ; 0x00A1 = WM_NCLBUTTONDOWN, 2 = HTCAPTION -> lets the borderless window be dragged.
+    PostMessage(0x00A1, 2, 0, , "ahk_id " MyGui.Hwnd)
+}
+
+;---- Double-click anywhere on the keyboard hides it.
+; NOTE: an earlier attempt tried to detect this by timing successive WM_LBUTTONDOWN
+; messages, which never worked -- Windows sends WM_LBUTTONDBLCLK instead of a second
+; WM_LBUTTONDOWN, so the second click was invisible to that code. (Amusingly, a
+; TRIPLE click did fire it, because click 3 arrives as a normal WM_LBUTTONDOWN and
+; still fell within the double-click time of click 1.) Watching for the real
+; double-click message is both correct and simpler. Triple-click still hides, since
+; a triple-click contains a double-click.
+WM_LBUTTONDBLCLK(wParam, lParam, msg, hwnd) {
+    global MyGui, k_DblClickHides
+
+    if (!k_DblClickHides)
+        return
+    if (hwnd != MyGui.Hwnd)
+        return
+
+    HideKeyboard()
+    return 0
+}
+
+;---- Right-click anywhere on the keyboard hides it. No drag loop to work around
+; here, so this one is straightforward. Guarded to this window; the ~*RButton
+; hotkey still lights up the on-screen R button as usual.
+WM_RBUTTONDOWN(wParam, lParam, msg, hwnd) {
+    global MyGui, k_RightClickHides
+
+    if (!k_RightClickHides)
+        return
+    if (hwnd != MyGui.Hwnd)
+        return
+
+    HideKeyboard()
+    return 0
 }
 
 ;---- Swallow menu activation (F10 / lone Alt) so the borderless GUI can't get
@@ -438,16 +576,13 @@ WM_SYSCOMMAND(wParam, lParam, msg, hwnd) {
         return 0
 }
 
-;---- Esc handler: light up the Esc key, and hide the GUI if it's the active window
-EscPress(ThisHotkey) {
+;---- Esc RELEASE: fade the key like any other, then hide the GUI if it's active.
+; The Esc key's highlight-on-down is handled by the generic KeyPress handler.
+EscRelease(ThisHotkey) {
     global buttons, MyGui, k_IsVisible
 
-    ; Light up the on-screen Esc like any other key.
-    if buttons.Has("Escape") {
-        SetKeyActive("Escape", true)
-        KeyWait("Escape")
-        SetKeyActive("Escape", false)
-    }
+    if buttons.Has("Escape")
+        StartKeyFade("Escape")
 
     ; Preserve original behavior: Esc hides the keyboard when it's the active window.
     if WinActive("ahk_id " MyGui.Hwnd) && k_IsVisible
