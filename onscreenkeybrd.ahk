@@ -10,7 +10,7 @@
 ; https://autohotkey.com/docs/scripts/KeyboardOnScreen.htm
 ; Converted to AHK v2 by kunkel321 using Claude AI. 
 ; Code also reworked with ChatGPT.
-; Version date: 7-12-2026  
+; Version date: 7-15-2026  
 ;
 ; This script creates a mock keyboard at the bottom of your screen that shows
 ; the keys you are pressing in real time. It helps with learning to touch-type
@@ -252,8 +252,17 @@ Loop 49 {
     k_ASCII := 44 + A_Index
     k_char := Chr(k_ASCII)
     k_char := StrUpper(k_char)
-    ; Skip special characters that cause issues
-    if !InStr("<>^~,", k_char) {
+    ; Skip characters that must NOT be registered as their own hotkeys:
+    ;   ^ ~ , <  -> hotkey-SYNTAX characters (Ctrl, passthrough, separator, and the
+    ;               left/right-modifier prefixes), plus > for symmetry.
+    ;   : ? @    -> SHIFTED glyphs that share a physical key with ; / 2 . Registering
+    ;               e.g. ~*? makes AHK fire IT (not ~*/) on Shift+/, because a
+    ;               shift-required variant is the more specific match. It then resolves
+    ;               to a "?" button that doesn't exist, so / never lights up under Shift.
+    ;               Skipping them lets ~*/ ~*; ~*2 fire for the shifted presses too,
+    ;               lighting the correct on-screen key.
+    ; (< and > -- the shifted glyphs of , and . -- are already covered by the syntax set.)
+    if !InStr("<>^~,:?@", k_char) {
         Hotkey("~*" . k_char, KeyPress)
         Hotkey("~*" . k_char . " up", KeyRelease)
     }
@@ -448,13 +457,13 @@ ResolveButtonKey(hk) {
     if InStr(thisKey, "Win")
         return "Win"
 
+    ; Only Esc needs remapping: its hotkey fires as "Esc" but the button is stored
+    ; under "Escape". Backspace, the arrows, Delete, etc. are all stored under the same
+    ; name their hotkey fires as, so they must pass through UNCHANGED -- an earlier
+    ; version remapped Backspace->"BS" and the arrows->"↑←↓→", none of which exist as
+    ; button keys, so those keys never highlighted.
     switch thisKey {
-        case "Backspace": return "BS"
-        case "Esc":       return "Escape"   ; hotkey is "Esc", button is stored as "Escape"
-        case "Up":        return "↑"
-        case "Left":      return "←"
-        case "Down":      return "↓"
-        case "Right":     return "→"
+        case "Esc": return "Escape"   ; hotkey fires as "Esc", button is stored as "Escape"
     }
     return thisKey
 }
