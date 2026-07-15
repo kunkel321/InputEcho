@@ -1,4 +1,4 @@
-![Screenshot of main window](https://github.com/kunkel321/OnScreenKeyboard/blob/main/OnScreenKBscreenCase.gif)
+![Screenshot of main window](https://github.com/kunkel321/OnScreenKeyboard/blob/main/OnScreenKBscreenCastgif.gif)
 
 # On-Screen Keyboard (v2) -- Original by Jon
 
