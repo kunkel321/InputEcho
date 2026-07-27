@@ -1,16 +1,11 @@
-﻿#SingleInstance
-#Requires AutoHotkey v2+
-; Allow a key's handler to re-enter (e.g. a fast re-press arriving during the brief
-; restrike blink) instead of silently discarding the press. Handlers are non-blocking,
-; so a few concurrent threads are cheap.
-#MaxThreadsPerHotkey 3
-#MaxThreads 20
-
-; On-Screen Keyboard (v2) -- Original by Jon
+﻿; ==============================================================================
+; On-Screen Keyboard --  Version date: 7-27-2026  
+; AHK Forums    https://www.autohotkey.com/boards/viewtopic.php?f=83&t=139991
+; GitHub        https://github.com/kunkel321/OnScreenKeyboard
+; Based on riginal On-Screen Keyboard by Jon
 ; https://autohotkey.com/docs/scripts/KeyboardOnScreen.htm
 ; Converted to AHK v2 by kunkel321 using Claude AI. 
 ; Code also reworked with ChatGPT.
-; Version date: 7-15-2026  
 ;
 ; This script creates a mock keyboard at the bottom of your screen that shows
 ; the keys you are pressing in real time. It helps with learning to touch-type
@@ -18,14 +13,53 @@
 ; an on-screen display for screencasts(?) The keyboard appearance can be
 ; customized. You can hide/show it via the tray menu.  Drag to move.
 ; Ctrl+Alt+K show/hide; Alt+arrow / Alt+wheel transparency
+; ==============================================================================
+
+#SingleInstance
+#Requires AutoHotkey v2+
+; Allow a key's handler to re-enter (e.g. a fast re-press arriving during the brief
+; restrike blink) instead of silently discarding the press. Handlers are non-blocking,
+; so a few concurrent threads are cheap.
+#MaxThreadsPerHotkey 3
+#MaxThreads 20
+
+; 7-25-2026 Add k_CondensedMode switch: shorter key height for a compact screencast-friendly layout; default false keeps full physical-keyboard proportions for touch-typing practice.
+; Condense only the five main rows (30→20px)
+; F-row shrinks slightly and its heights derive from the full key height so labels never get crushed. Width, spacing, and font unchanged.
+
+; 7-27-2026 Add hook-front jumping: OSK's low-level hooks are force-reinstalled so
+; they sit FIRST in the system's hook chain. Windows calls the most recently
+; installed hook first, and a hook that SUPPRESSES a key (e.g. ScreenSnip's
+; Alt+. / Alt+, hotkeys) never passes the event down the chain -- which is why
+; combos eaten by other scripts never lit up here. With our passthrough (~*) hooks
+; in front, we highlight the key and hand it down the chain; the suppressing app
+; still works exactly as before. See JumpHooksToFront() near the bottom of the
+; auto-execute section.
+; (A Raw Input rewrite was tried first and FAILED: hook-suppressed keys do not
+; reach WM_INPUT listeners on modern Windows -- raw input delivery happens after
+; the hook chain, despite widespread folklore to the contrary. Empirically
+; verified on this machine: suppressed key-downs vanished, unsuppressed key-ups
+; arrived. Don't go down that road again.)
 
 TraySetIcon("shell32.dll",45) ; Icon of a brownish square with a key image.
+A_IconTip := "On-Screen Keyboard" (A_IsAdmin ? " (admin)" : "")  ; elevation at a glance
 ^Esc::ExitApp ; Ctrl+Esc to kill script
 
 ;---- Configuration Section
 k_FontSize := 10
 k_FontName := "Verdana"  ; Leave empty to use system default
 k_FontStyle := "Bold"    ; Examples: "Italic Underline"
+
+; Condensed mode: shrink the key HEIGHT only, so the whole keyboard takes up less
+; vertical space. Width, spacing, font, and labels are identical in both modes -- only
+; the rows get shorter.
+;   false -> FULL height. Keys are ~square, close to a real keyboard's proportions. Best
+;            when using the tool to PRACTICE TOUCH-TYPING: it mirrors the feel and footprint
+;            of the physical keyboard, so muscle memory transfers.
+;   true  -> CONDENSED. The five main rows are noticeably shorter; the F-row shrinks only
+;            slightly (its Esc / F10 / Del labels are the tightest fit). Best for SCREENCASTS,
+;            where a short overlay stays out of the way of whatever you're recording.
+k_CondensedMode := true
 
 ; Key colors. Use 6-digit RGB hex values without the leading #.
 ; Text controls are used instead of real Button controls because they allow
@@ -68,8 +102,8 @@ k_MouseFadeColors := BuildFadeGradient(k_MouseActiveColor, k_MouseBackColor, k_F
 k_ToggleHotkey := "^!k"              ; ^ = Ctrl, ! = Alt  -> Ctrl+Alt+K
 k_ToggleHotkeyLabel := "Ctrl+Alt+K"
 
-k_MenuItemHide := "Hide on-screen &keyboard`t" . k_ToggleHotkeyLabel
-k_MenuItemShow := "Show on-screen &keyboard`t" . k_ToggleHotkeyLabel
+k_MenuItemHide := "Hide Keyboard -- " . k_ToggleHotkeyLabel
+k_MenuItemShow := "Show Keyboard -- " . k_ToggleHotkeyLabel
 
 k_Monitor := ""  ; Leave empty for primary monitor, or specify 2, 3, etc.
 
@@ -81,9 +115,13 @@ k_Transparency := 255       ; current alpha: 255 = fully opaque, lower = more tr
 k_TransparencyStep := 15    ; amount each keypress / wheel notch changes the alpha
 k_TransparencyMin := 30     ; floor so the window never fades away completely
 
+; OSK will reestablish keyboard hooks with this frequency (millisecs) to ensre that
+; other apps don't "eat" key-combos.  This is useful for screencasts.  Rehooks only
+; occur if/when the OSK gui is not hidden. 
+K_HookFrequency := 3000
+
 ;---- Calculate dimensions based on font size
 k_KeyWidth := k_FontSize * 3
-k_KeyHeight := k_FontSize * 3
 k_KeyMargin := Floor(k_FontSize / 6)
 k_SpacebarWidth := k_FontSize * 25
 k_KeyWidthHalf := Floor(k_KeyWidth / 2)
@@ -91,14 +129,32 @@ k_ModifierWidth := k_KeyWidth + 20  ; Extra width for modifier keys
 k_ShiftWidth := k_KeyWidth + 40     ; Wider for Shift
 k_Row3Offset := k_KeyWidthHalf + 18 ; Offset for third row (ASDF...)
 
-; F-row keys: same WIDTH as normal keys, but SHORTER, with a smaller font so the
-; longer labels (Esc, F10, F11, F12, Del) still fit. Lower k_FKeyHeight toward
-; Floor(k_KeyHeight / 2) if you want the row even shorter.
-k_FKeyFontSize := k_FontSize - 2          ; smaller font just for the F-row
-k_FKeyHeight := Floor(k_KeyHeight * 0.6)  ; ~60% of normal key height
+; ---- Key HEIGHT -- the only thing k_CondensedMode changes ----
+; Main rows (number, QWERTY, ASDF, Shift, modifier/Space). The layout flows each row just
+; below the previous one and reads positions back with GetPos, so simply making the keys
+; shorter packs the whole GUI tighter -- no other spacing math needs touching. Drop
+; k_KeyHeightCondensed toward Floor(k_FontSize * 1.8) if you want it shorter still; below
+; roughly that the labels start to feel cramped at this font size.
+k_KeyHeightFull      := k_FontSize * 3         ; 30 at font 10 -- ~physical-keyboard height
+k_KeyHeightCondensed := Floor(k_FontSize * 1.9)  ; 20 -- about a third shorter, still legible
+k_KeyHeight := k_CondensedMode ? k_KeyHeightCondensed : k_KeyHeightFull
+
+; F-row keys: same WIDTH as normal keys, but SHORTER, with a smaller font so the longer
+; labels (Esc, F10, F11, F12, Del) still fit. BOTH F-row heights are fractions of the FULL
+; key height (never the condensed one), so the F-row shrinks only a little in condensed mode
+; and its labels are never crushed. Lower the 0.5 toward Floor(k_KeyHeightFull / 2) for an
+; even shorter row.
+k_FKeyFontSize        := k_FontSize - 2                 ; smaller font just for the F-row
+k_FKeyHeightFull      := Floor(k_KeyHeightFull * 0.6)   ; ~18 -- normal F-row height
+k_FKeyHeightCondensed := Floor(k_KeyHeightFull * 0.5)   ; ~15 -- only a touch shorter
+k_FKeyHeight := k_CondensedMode ? k_FKeyHeightCondensed : k_FKeyHeightFull
 
 ;---- Create the GUI
+; The title is never shown (the window is caption-less) but it gives other AC2 tools
+; a stable handle to find this window if they want to PostMessage it directly instead
+; of broadcasting. See the "external highlight" receiver further below.
 MyGui := Gui()
+MyGui.Title := "OnScreenKeyboardDisplay"
 MyGui.Opt("-Caption +ToolWindow")
 MyGui.SetFont("s" . k_FontSize . " " . k_FontStyle, k_FontName)
 
@@ -219,6 +275,18 @@ OnMessage(0x0204, WM_RBUTTONDOWN)  ; WM_RBUTTONDOWN
 ; focused (never during normal use), but the fix is cheap and clean.
 OnMessage(0x0112, WM_SYSCOMMAND)  ; WM_SYSCOMMAND
 
+;---- External highlight channel (for other AC2 tools, e.g. ScreenSnip).
+; Some tools suppress a mouse button to do their own thing (ScreenSnip suppresses
+; RButton during a Ctrl+RClick-drag snip so no context menu appears). A suppressed
+; button never reaches this script's mouse hook, so ~*RButton can't light it up. The
+; fix: the other tool tells us directly. It PostMessages this registered message with
+;   wParam = 1 to light a button, 0 to release/fade it
+;   lParam = 1 for LButton, 2 for RButton   (matches VK_LBUTTON / VK_RBUTTON)
+; RegisterWindowMessage returns the SAME id in every process for a given string, so the
+; sender just computes it the same way -- no shared header or hard-coded number needed.
+k_ExtHighlightMsg := DllCall("RegisterWindowMessage", "Str", "AHK_OSK_MouseHighlight", "UInt")
+OnMessage(k_ExtHighlightMsg, OnExternalHighlight)
+
 ;---- Get GUI dimensions and ID
 k_ID := MyGui.Hwnd
 WinGetPos(, , &k_WindowWidth, &k_WindowHeight, "ahk_id " k_ID)
@@ -318,8 +386,40 @@ Hotkey("!WheelUp",   AdjustTransparency.Bind( k_TransparencyStep))
 Hotkey("!WheelDown", AdjustTransparency.Bind(-k_TransparencyStep))
 HotIf()  ; reset to global context for anything registered afterward
 
+;---- HOOK-FRONT JUMPING: the fix for other apps "eating" key combos. ----
+; All of this script's display hotkeys are ~* passthrough, so being FIRST in the
+; low-level hook chain is pure win: we see and highlight every physical key, then
+; pass the event down the chain, where a suppressing script (ScreenSnip et al.)
+; can still eat it for its own purposes. Windows calls the most recently installed
+; hook first, so "jump to the front" = force our hooks to reinstall. Re-asserted on
+; a timer because any app that installs a hook later takes the front spot back.
+; Cost of the force-reinstall: a microsecond gap where our hook is absent; a key
+; landing exactly in that gap misses its highlight. At this cadence, negligible.
+; (Bonus: also self-heals if Windows silently removes a hook for responding too
+; slowly under load, which it is documented to do.)
+JumpHooksToFront() {
+    global k_IsVisible
+    ; While hidden, nobody can see the highlights, so front-of-chain position is
+    ; worthless -- and every force-reinstall carries a microsecond gap where a
+    ; keystroke could slip past unhighlighted. Skip the churn until shown again;
+    ; ShowKeyboard() calls us immediately on unhide so there's no 3-second lag.
+    if !k_IsVisible
+        return
+    InstallKeybdHook(true, true)   ; true, true = install + FORCE reinstall
+    InstallMouseHook(true, true)
+}
+JumpHooksToFront()
+SetTimer(JumpHooksToFront, K_HookFrequency)
+
 ;---- Tray menu setup
 TrayMenu := A_TrayMenu
+; Grayed status line at the top: shows elevation state right in the menu. (The
+; A_IconTip set near the top of the script shows the same info as the tray icon's
+; HOVER tooltip; this menu line is the click-visible twin.) Disabled items still
+; need a callback in v2, hence the no-op.
+k_StatusLine := "On-Screen Keyboard " (A_IsAdmin ? "(admin)" : "(NOT admin)")
+TrayMenu.Insert("1&", k_StatusLine, (*) => "")
+TrayMenu.Disable(k_StatusLine)
 TrayMenu.Add(k_MenuItemHide, ToggleKeyboard)
 TrayMenu.Default := k_MenuItemHide
 
@@ -504,6 +604,22 @@ MouseWheelPress(ThisHotkey) {
     }
 }
 
+;---- Receiver for the external highlight message (see k_ExtHighlightMsg registration).
+; A sibling tool asks us to light or fade a mouse button it is about to suppress on its
+; own. We route through the same SetKeyActive / StartKeyFade paths a real press uses, so
+; the on-screen button behaves identically (mouse colors, fade ramp, etc.). A lit button
+; stays lit until the sender posts the matching release, so it holds through a long drag.
+OnExternalHighlight(wParam, lParam, *) {
+    static codeToKey := Map(1, "LButton", 2, "RButton")
+    if !codeToKey.Has(lParam)
+        return
+    buttonKey := codeToKey[lParam]
+    if wParam
+        SetKeyActive(buttonKey, true, IsMouseKey(buttonKey))   ; light it
+    else
+        StartKeyFade(buttonKey, IsMouseKey(buttonKey))         ; fade it out
+}
+
 ;---- Show / hide / toggle the keyboard. All three entry points (tray item, Esc,
 ; and the global hotkey) route through these so k_IsVisible and the menu label
 ; can never drift out of sync.
@@ -514,6 +630,9 @@ ShowKeyboard() {
     MyGui.Show()
     TrayMenu.Rename(k_MenuItemShow, k_MenuItemHide)
     k_IsVisible := true
+    ; Hook jumps are paused while hidden (see JumpHooksToFront), so grab the front
+    ; of the hook chain NOW rather than waiting up to 3s for the next timer tick.
+    JumpHooksToFront()
 }
 
 HideKeyboard() {
