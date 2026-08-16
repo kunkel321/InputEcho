@@ -1,4 +1,4 @@
-![Screenshot of main window](https://github.com/kunkel321/OnScreenKeyboard/blob/main/OnScreenKBscreenCastgif.gif)
+![Screenshot of main window](https://github.com/kunkel321/InputEcho/blob/main/InputEchoDemo.gif)
 
 # InputEcho
 - Evolved from On-Screen Keyboard, which was based on the original by Jon Lehnemann, et al.
